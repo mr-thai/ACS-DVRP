@@ -6,9 +6,14 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
+
+using namespace std;
+
+#include "data-model.cpp"
 
 class ACSDVRP {
 private:
@@ -20,6 +25,7 @@ private:
     double tau0;
     Config cfg;
     bool debug_mode = false;
+    mt19937 rng;
 
     vector<Vehicle> fleet;
     vector<int> committed;
@@ -27,9 +33,14 @@ private:
 
 public:
     void set_debug(bool d) { debug_mode = d; }
+    
+    /*
+    input: Instance inst (nodes, capacity, vehicles), Config config, seed
+    output: Initialized ACSDVRP object with distance matrix, eta matrix, pheromone matrix
+    Khởi tạo giải thuật ACS-DVRP với dữ liệu bài toán và tham số cấu hình
+    */
     ACSDVRP(const Instance& inst, Config config, int seed = 42)
-        : nodes(inst.nodes), capacity_inst(inst.capacity), cfg(config) {
-        (void)seed;
+        : nodes(inst.nodes), capacity_inst(inst.capacity), cfg(config), rng(seed) {
 
         int n = nodes.size();
         dist.assign(n, vector<double>(n));
@@ -51,7 +62,11 @@ public:
         }
     }
 
-    // Bảo tồn Pheromone giữa các lát cắt thời gian
+    /*
+    input: tau matrix (pheromone levels)
+    output: Updated tau matrix after preservation
+    Bảo tồn pheromone giữa các lát cắt thời gian bằng cách giảm dần giá trị pheromone
+    */
     void preserve_pheromone() {
         int n = nodes.size();
         for (int i = 0; i < n; ++i) {
@@ -61,24 +76,54 @@ public:
         }
     }
 
-    // Quy tắc chuyển trạng thái của ACS
+    /*
+    input: curr (nút hiện tại), allowed (danh sách nút có thể chọn), beta (hệ số eta)
+    output: best_node (nút được chọn dựa trên quy tắc ACS)
+    Áp dụng quy tắc chuyển trạng thái của ACS để chọn nút tiếp theo với độ ưu tiên cao nhất
+    */
     int select_next(int curr, const vector<int>& allowed, double beta) {
         if (allowed.empty()) return 0;
 
         int best_node = allowed[0];
         double max_val = -1.0;
+        vector<double> weights;
+        weights.reserve(allowed.size());
+        double weight_sum = 0.0;
         for (int j : allowed) {
             double eta_val = eta[curr][j];
             double val = (beta == 1.0) ? (tau[curr][j] * eta_val) : (tau[curr][j] * pow(eta_val, beta));
+            weights.push_back(val);
+            weight_sum += val;
             if (val > max_val || (val == max_val && j < best_node)) {
                 max_val = val;
                 best_node = j;
             }
         }
+
+        uniform_real_distribution<double> dist01(0.0, 1.0);
+        double q = dist01(rng);
+        if (q <= cfg.q0 || weight_sum <= 0.0) {
+            return best_node;
+        }
+
+        uniform_real_distribution<double> pick01(0.0, weight_sum);
+        double pick = pick01(rng);
+        double cumulative = 0.0;
+        for (size_t i = 0; i < allowed.size(); ++i) {
+            cumulative += weights[i];
+            if (pick <= cumulative) {
+                return allowed[i];
+            }
+        }
+
         return best_node;
     }
 
-    // Kiểm tra xem nút có đã được phục vụ chưa
+    /*
+    input: node_idx (chỉ số nút cần kiểm tra), committed_per_vehicle (danh sách nút đã cam kết)
+    output: true nếu nút đã được phục vụ, false nếu chưa
+    Kiểm tra xem nút có đã được phục vụ trong các tuyến cam kết hoặc danh sách pending
+    */
     bool is_node_served(int node_idx, const vector<vector<int>>& committed_per_vehicle) const {
         for (const auto& vec : committed_per_vehicle) {
             for (int c : vec) if (c == node_idx) return true;
@@ -87,7 +132,11 @@ public:
         return false;
     }
 
-    // Cập nhật danh sách đơn hàng đã xuất hiện
+    /*
+    input: slice_deadline (thời hạn lát cắt), committed_per_vehicle (nút đã cam kết)
+    output: Cập nhật pending (danh sách đơn hàng chưa xử lý)
+    Thêm các nút mới xuất hiện và chưa được phục vụ vào danh sách pending
+    */
     void update_pending_orders(double slice_deadline, const vector<vector<int>>& committed_per_vehicle) {
         for (size_t i = 1; i < nodes.size(); ++i) {
             if (!is_node_served(i, committed_per_vehicle) && nodes[i].appearance_time <= slice_deadline && nodes[i].appearance_time < cfg.T_co) {
@@ -96,7 +145,11 @@ public:
         }
     }
 
-    // Thực hiện tối ưu hóa ACS trong một lát cắt thời gian
+    /*
+    input: slice_duration (thời gian lát cắt), unserved_init (danh sách nút chưa phục vụ)
+    output: best_slice_tours, best_fleet_state, best_slice_vehicle_ids, best_slice_cost, found_feasible_solution
+    Chạy thuật toán ACS trong lát cắt hiện tại để tìm tuyến tối ưu và cập nhật pheromone
+    */
     void optimize_current_slice(double slice_duration, const vector<int>& unserved_init, vector<vector<int>>& best_slice_tours, vector<Vehicle>& best_fleet_state, vector<int>& best_slice_vehicle_ids, double& best_slice_cost, bool& found_feasible_solution) {
         vector<Vehicle> slice_start_fleet = fleet;
         best_slice_cost = 1e18;
@@ -190,7 +243,11 @@ public:
         }
     }
 
-    // Áp dụng chính sách cam kết và cập nhật trạng thái xe
+    /*
+    input: best_slice_tours, best_slice_vehicle_ids, slice_deadline, current_time
+    output: Cập nhật committed_per_vehicle, fleet state, pending list
+    Cam kết các tuyến được chọn, cập nhật trạng thái xe, và quản lý danh sách nút chưa xử lý
+    */
     void apply_commitment_policy(const vector<vector<int>>& best_slice_tours, const vector<int>& best_slice_vehicle_ids, double slice_deadline, double current_time, vector<vector<int>>& committed_per_vehicle) {
         bool time_beyond_cutoff = (current_time >= cfg.T_co);
         for (auto& v : fleet) {
@@ -234,7 +291,11 @@ public:
         }
     }
 
-    // Tối ưu hóa cục bộ (Local Search)
+    /*
+    input: tour (tuyến xe ban đầu)
+    output: Cải thiện tour bằng cách di chuyển các nút
+    Áp dụng local search để cải thiện tuyến xe bằng cách kiểm tra vị trí tối ưu của mỗi nút
+    */
     void local_search(vector<int>& tour) {
         if (tour.size() < 2) return;
         bool improved = true;
@@ -266,31 +327,51 @@ public:
         }
     }
 
-    // Event manager: cập nhật thời gian lát cắt và các đơn hàng đã xuất hiện
+    /*
+    input: current_time, slice_duration, committed_per_vehicle
+    output: slice_deadline (thời hạn lát cắt), boolean (có nút pending hay không)
+    Quản lý sự kiện thời gian: cập nhật deadline lát cắt và danh sách đơn hàng đã xuất hiện
+    */
     bool event_manager_step(double current_time, double slice_duration, vector<vector<int>>& committed_per_vehicle, double& slice_deadline) {
         slice_deadline = current_time + slice_duration + cfg.T_ac;
         update_pending_orders(slice_deadline, committed_per_vehicle);
         return !pending.empty();
     }
 
-    // ACS solver: tối ưu hóa tuyến trong lát cắt hiện tại
+    /*
+    input: slice_duration, pending (danh sách nút chưa phục vụ)
+    output: best_slice_tours, best_fleet_state, best_slice_vehicle_ids, best_slice_cost, boolean (có giải pháp hay không)
+    Thực thi bước ACS solver trong một lát cắt thời gian để tìm tuyến tối ưu
+    */
     bool acs_solver_step(double slice_duration, vector<vector<int>>& best_slice_tours, vector<Vehicle>& best_fleet_state, vector<int>& best_slice_vehicle_ids, double& best_slice_cost) {
         bool found_feasible_solution = false;
         optimize_current_slice(slice_duration, pending, best_slice_tours, best_fleet_state, best_slice_vehicle_ids, best_slice_cost, found_feasible_solution);
         return found_feasible_solution;
     }
 
-    // Commitment policy: chốt các tuyến được chọn cho lát cắt
+    /*
+    input: best_slice_tours, best_slice_vehicle_ids, slice_deadline, current_time
+    output: Cập nhật committed_per_vehicle
+    Chốt các tuyến được chọn trong lát cắt hiện tại vào danh sách cam kết
+    */
     void commitment_policy_step(const vector<vector<int>>& best_slice_tours, const vector<int>& best_slice_vehicle_ids, double slice_deadline, double current_time, vector<vector<int>>& committed_per_vehicle) {
         apply_commitment_policy(best_slice_tours, best_slice_vehicle_ids, slice_deadline, current_time, committed_per_vehicle);
     }
 
-    // Pheromone strategy: bảo tồn pheromone giữa các lát cắt thời gian
+    /*
+    input: tau matrix (pheromone levels)
+    output: Cập nhật tau matrix
+    Thực thi bước pheromone strategy để bảo tồn pheromone giữa các lát cắt thời gian
+    */
     void pheromone_strategy_step() {
         preserve_pheromone();
     }
 
-    // Chạy mô phỏng thực tế
+    /*
+    input: Instance data, Config parameters
+    output: total_cost (tổng chi phí của tất cả các tuyến)
+    Chạy mô phỏng toàn bộ quá trình DVRP theo thời gian thực, qua từng lát cắt thời gian
+    */
     double run_simulation() {
         double total_cost = 0.0;
         double slice_duration = cfg.T / cfg.nts;
